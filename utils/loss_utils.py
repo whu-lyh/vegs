@@ -15,6 +15,10 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 
+import matplotlib.cm as cm
+from utils.image_utils import rgb2loftrgray
+
+
 def l1_loss(network_output, gt, mask=None):
     if mask is None:
         return torch.abs((network_output - gt)).mean()
@@ -26,6 +30,52 @@ def l2_loss(network_output, gt, mask=None):
         return (((network_output - gt) ** 2) * mask).sum() / mask.sum()
     else:
         return ((network_output - gt) ** 2).mean()
+
+def loss_mse(reder_img, gt):
+    loss_fn = torch.nn.MSELoss()
+    loss2 = loss_fn(reder_img, gt)
+    return loss2
+
+def pearson_depth_loss(depth_src, depth_target):
+    #co = pearson(depth_src.reshape(-1), depth_target.reshape(-1))
+
+    src = depth_src - depth_src.mean()
+    target = depth_target - depth_target.mean()
+
+    src = src / (src.std() + 1e-6)
+    target = target / (target.std() + 1e-6)
+
+    co = (src * target).mean()
+    assert not torch.any(torch.isnan(co))
+    return 1 - co
+
+def loss_loftr(q_img, r_img, matcher, threshold, min_num_points):
+    q_img_gray = rgb2loftrgray(q_img)
+    r_img_gray = rgb2loftrgray(r_img)
+    batch = {'image0':q_img_gray, 'image1':r_img_gray}
+    matcher(batch)
+    mkpts0 = batch['mkpts0_f']
+    mkpts1 = batch['mkpts1_f']
+    mconf = batch['mconf']
+    # print(mconf)
+    #Select a subset of matching points with higher confidence.
+    indices = torch.nonzero(mconf > threshold).squeeze()
+    # print(indices.shape)
+    count = indices.numel()
+    if count < min_num_points:
+        return None
+    x1 = mkpts0[indices, 0] / 376
+    y1 = mkpts0[indices, 1] / 1408
+    x2 = mkpts1[indices, 0] / 376
+    y2 = mkpts1[indices, 1] / 1408
+    # x1 = mkpts0[indices, 0] / 640 # for blender dataset
+    # y1 = mkpts0[indices, 1] / 480
+    # x2 = mkpts1[indices, 0] / 640
+    # y2 = mkpts1[indices, 1] / 480
+    error_i = (x1 - x2) ** 2 + (y1 - y2) ** 2
+    error_i = error_i.float().cuda()
+    loss = torch.sum(error_i)/len(indices)
+    return loss
 
 def gaussian(window_size, sigma):
     gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -87,7 +137,6 @@ def reduction_batch_based(image_loss, M):
         return 0
     else:
         return torch.sum(image_loss) / divisor
-
 
 def reduction_image_based(image_loss, M):
     # mean of average of valid pixels of an image
@@ -169,7 +218,6 @@ class GradientLoss(nn.Module):
                                    mask[:, ::step, ::step], reduction=self.__reduction)
 
         return total
-
 
 class MSELoss(nn.Module):
     def __init__(self, reduction='batch-based'):

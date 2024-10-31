@@ -62,6 +62,8 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self.num_points = 20000 # the number of sampled points # FIXME
+        self.radius = 30 # radius of sphere
 
     def capture(self):
         return (
@@ -96,6 +98,56 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        
+    def restore_no_trainargs(self, model_args, training_args):
+        (self.active_sh_degree, 
+        self._xyz, 
+        self._features_dc, 
+        self._features_rest,
+        self._scaling, 
+        self._rotation, 
+        self._opacity,
+        self.max_radii2D, 
+        xyz_gradient_accum, 
+        denom,
+        opt_dict, 
+        self.spatial_lr_scale) = model_args
+        self.xyz_gradient_accum = xyz_gradient_accum
+        self.denom = denom
+        if training_args is not None:
+            self.training_setup(training_args)
+            self.optimizer.load_state_dict(opt_dict)
+        
+    def restore_cz(self, model_args, training_args=None):
+        (self.active_sh_degree, 
+        self._xyz, 
+        self._xyz_offset,
+        self._features_dc, 
+        self._features_rest,
+        self._scaling, 
+        self._rotation, 
+        self._opacity,
+        self.max_radii2D, 
+        # xyz_gradient_accum, 
+        xyz_offset_gradient_accum, 
+        denom,
+        opt_dict, 
+        self.spatial_lr_scale,
+        self._instance_feat,
+        self._semantic_logits,
+        self.appearance_model,
+        upscale_net_state,
+        self.init_pts_num) = model_args
+
+        # self.upscale_feat_net.load_state_dict(upscale_net_state)
+        # self.upscale_feat_net = self.upscale_feat_net.to("cuda") 
+
+        # self.xyz_gradient_accum = xyz_gradient_accum
+        self.xyz_offset_gradient_accum = xyz_offset_gradient_accum
+        self.denom = denom
+        if training_args is not None:
+            self.training_setup(training_args)
+            self.optimizer.load_state_dict(opt_dict)
 
     @property
     def get_scaling(self):
@@ -126,25 +178,83 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def sample_points_on_sphere(self, center):
+        """
+        sample num_points points at the given center point in a sphere with radius is radius
+
+        :param center: center origin, size:(3,)
+        :return: size: [num_points, 3]
+        """
+        device = center.device
+        theta = 2 * torch.pi * torch.rand(self.num_points).to(device) # normally distributed at [0, 2\pi]
+        phi = torch.acos(2 * torch.rand(self.num_points) - 1).to(device) # normally distributed at [0, \pi]
+        x = self.radius * torch.sin(phi) * torch.cos(theta)
+        y = self.radius * torch.sin(phi) * torch.sin(theta)
+        z = self.radius * torch.cos(phi)
+        points = torch.stack([x, y, z], dim=-1) + center
+        return points
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        # get the centeriod of input point clouds # lyh
+        center = torch.mean(fused_point_cloud, dim=0)
+        sky_points = self.sample_points_on_sphere(center)
+        # concate the background points and the initial point clouds # lyh
+        fused_point_cloud = torch.cat((fused_point_cloud, sky_points), dim=0)
+        new_pcd = fused_point_cloud.cpu().numpy()
+        new_color = np.zeros((self.num_points, 3), dtype=np.float32)
+        # initialize the sphere harmonics parameters based on the initial rgb
+        fused_color = RGB2SH(torch.tensor(np.concatenate((np.asarray(pcd.colors), new_color), axis=0)).float().cuda()) # lyh
+        # features are the learnable sphere harmonics parameters
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0] = fused_color # B x 3(rgb) x SHdegree
-        features[:, 3:, 1:] = 0.0 # I have no clue why this is here
-
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-        #dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        dist2 = torch.clamp(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), min=0.0000001, max=0.2)
+        # covariance matrix: search the nearest points, and calculate the mean distance and initialized as scale
+        # it is a one-time operation that is done for initialization
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(new_pcd).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True)) # zero-degree (RGB) color
+        # Too high learning rates for the higher bands lead to too strong view-dependent overfitting. thus the sh feature are seperated manally
+        # https://github.com/graphdeco-inria/gaussian-splatting/issues/438
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+    # backup of create_from_pcd
+    def create_from_custom_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+        self.spatial_lr_scale = spatial_lr_scale
+        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        # initialize the sphere harmonics parameters based on the initial rgb
+        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        # features are the learnable sphere harmonics parameters
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0
+
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        # covariance matrix: search the nearest points, and calculate the mean distance and initialized as scale
+        # it is a one-time operation that is done for initialization
+        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
+        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        # Too high learning rates for the higher bands lead to too strong view-dependent overfitting. thus the sh feature are seperated manally
+        # https://github.com/graphdeco-inria/gaussian-splatting/issues/438
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
@@ -411,7 +521,6 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
-
 
 
 class GaussianBoxModel(GaussianModel):

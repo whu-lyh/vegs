@@ -304,8 +304,9 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
 
 def getProjectionMatrixwithPrincipalPointOffset(znear, zfar, fovX, fovY, fx, fy, cx, cy, w, h):
     '''
-        Reference for refleecting principal point shift to calculate the projection matrix
+        Reference for reflecting principal point shift to calculate the projection matrix
         http://ksimek.github.io/2013/06/03/calibrated_cameras_in_opengl/
+        Also see the issue at here https://github.com/graphdeco-inria/gaussian-splatting/issues/144#issuecomment-2014173022
     '''
     
     tanHalfFovY = math.tan((fovY / 2))
@@ -322,7 +323,8 @@ def getProjectionMatrixwithPrincipalPointOffset(znear, zfar, fovX, fovY, fx, fy,
     top = top_c + dy
     bottom = bottom_c + dy 
     left = left_c + dx
-    right = right_c + dx    
+    right = right_c + dx
+
     P = torch.zeros(4, 4)
     z_sign = 1.0
 
@@ -366,3 +368,71 @@ def cam_normal_to_world_normal(norm_pred, R_cam2world):
     norm_pred_world = (torch.from_numpy(R_cam2world[None, None, :, :]).to(norm_pred.device).float() @ norm_pred_cam)   # torch.Size([376, 1408, 3, 1])
     norm_pred_world = norm_pred_world.squeeze().permute(2,0,1) # => c, h, w            
     return norm_pred_world
+
+def skew_symmetric(w):
+    """
+    skew symmetric matrix
+
+    Args:
+        w (tensor): Lie algebra \in \mathcal{R}^3
+
+    Returns:
+        tensor: skew symmetric matrix \in mathcal{R}^{3\times3}
+    """
+    w0,w1,w2 = w.unbind(dim=-1)
+    O = torch.zeros_like(w0)
+    wx = torch.stack([torch.stack([O,-w2,w1],dim=-1),
+                        torch.stack([w2,O,-w0],dim=-1),
+                        torch.stack([-w1,w0,O],dim=-1)],dim=-2)
+    return wx
+
+def taylor_A(x, nth=10):
+    # Taylor expansion of sin(x)/x
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        if i>0: denom *= (2*i)*(2*i+1)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+def taylor_B(x, nth=10):
+    # Taylor expansion of (1-cos(x))/x**2
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        denom *= (2*i+1)*(2*i+2)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+def taylor_C(x, nth=10):
+    # Taylor expansion of (x-sin(x))/x**3
+    ans = torch.zeros_like(x)
+    denom = 1.
+    for i in range(nth+1):
+        denom *= (2*i+2)*(2*i+3)
+        ans = ans+(-1)**i*x**(2*i)/denom
+    return ans
+
+def se3_to_SE3(w, v): # [...,3]
+    """ 
+    Exponential map from Lie algebra se3 to the Lie group SE(3)
+    cite from https://hades.mech.northwestern.edu/images/7/7f/MR.pdf page:105
+    Args:
+        w (tensor): rotation part: 3*1
+        v (tensor): translation part: 3*1
+
+    Returns:
+        tensor: SE3 \in \mathcal{R}^{4\times4}
+    """
+    deltaT = torch.zeros((4, 4)).cuda()
+    wx = skew_symmetric(w)
+    theta = w.norm(dim=-1) # the norm of rotation vecter
+    I = torch.eye(3, device=w.device, dtype=torch.float32)
+    A = taylor_A(theta)
+    B = taylor_B(theta)
+    C = taylor_C(theta)
+    deltaT[:3, :3] = I+A*wx+B*wx@wx
+    V = I+B*wx+C*wx@wx
+    deltaT[:3, 3] = V@v
+    deltaT[3, 3] = 1.
+    return deltaT

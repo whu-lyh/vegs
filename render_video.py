@@ -9,35 +9,59 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch
-from scene import Scene
-import os, gc
-from tqdm import tqdm
-from os import makedirs
-from gaussian_renderer import render, render_all, render_dyn, return_gaussians_boxes_and_box2worlds
-import torchvision
-from utils.general_utils import safe_state
+import gc
+import os
 from argparse import ArgumentParser
-from arguments import ModelParams, PipelineParams, KITTI360DataParams, BoxModelParams, get_combined_args
-from gaussian_renderer import GaussianModel
-from scene.cameras import Camera, make_camera_like_input_camera
-import numpy as np
-from train import render_novelview_image
-from utils.graphics_utils import quaternion_multiply, quaternion_to_matrix, matrix_to_quaternion, decompose_T_to_RS, decompose_box2world_to_RS
-import quaternion
-from PIL import Image
+from os import makedirs
+
 import cv2
+import numpy as np
+import quaternion
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+from arguments import (BoxModelParams, KITTI360DataParams, ModelParams,
+                       PipelineParams, get_combined_args)
+from gaussian_renderer import (GaussianModel, render, render_all, render_dyn,
+                               return_gaussians_boxes_and_box2worlds)
+from scene import Scene
+from scene.cameras import Camera, make_camera_like_input_camera
+from train import render_novelview_image, render_novelview_image_full
+from utils.general_utils import safe_state
+from utils.graphics_utils import (decompose_box2world_to_RS, decompose_T_to_RS,
+                                  matrix_to_quaternion, quaternion_multiply,
+                                  quaternion_to_matrix)
 
 
 def render_set(model_path, name, iteration, views, scene, pipe, background):
-    render_path = os.path.join(model_path, "results", "test", "aug_videos", str(iteration))
+    render_path = os.path.join(model_path, "results", name, "aug_videos_xyzrpy", str(iteration))
     os.makedirs(render_path, exist_ok=True)
 
-                        #Rx  Rz  Tz
-    cam_aug_params = [  [0, 0, 0], \
-                        [0, 60,  0],  \
-                        [0, -60,  0], \
-                        [-10, 0, 1] ]
+    # raw
+                        #Rx  Rz  Tz           # carefully note the x,z z not xy z, positive turn up, negative turn down
+    # cam_aug_params = [  [0, 0, 0], \
+    #                     [0, 60, 0],  \
+    #                     [0, -60, 0], \
+    #                     # [10, 0, 0],  \
+    #                     # [-10, 0, 0], \
+    #                     # [0, 20, -1],  \
+    #                     # [0, -20, -1], \
+    #                     # [0, 20, 2],  \
+    #                     # [0, -20, 2], \
+    #                     [-10, 0, 1] ]
+
+    #                     #Rx  Ry  Rz Tx Ty Tz           # carefully note the x,z z not xy z, positive turn up, negative turn down
+    cam_aug_params = [  [0, 0, 0, 0, 0, 0], \
+                        [0, 0, 60, 0, 0, 0], \
+                        [0, 0, -60, 0, 0, 0], \
+                        [0, 0, 0, 0, 0.5, 0],  \
+                        [0, 0, 0, 0, -0.5, 0], \
+                        [0, 0, 0, 1.0, 0, 0],  \
+                        [0, 0, 0, -1.0, 0, 0], \
+                        [10, 0, 0, 0, 0, 1.0], \
+                        [-10, 0, 0, 0, 0, 1.0]
+                        ]
 
     # Save GT cameras for visualization
     vid_images = []
@@ -48,7 +72,7 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
     vid_images = torch.stack(vid_images)
     save_video(vid_images, os.path.join(render_path, "train_cameras.mp4"), 5)
 
-    all_bboxes = scene.getTrainBboxes()
+    all_bboxes = scene.getTrainBboxes() # for the officical release dataset no dynamic objects detected!
 
     # Interpolate cameras
     n_jump = 1
@@ -57,7 +81,7 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
     # Use Cam 0 of stereo camera
     remove_first = 5 
     views = views[remove_first:][::2][::n_jump]
-    interp_views = []
+    interp_views = [] # this may cause the zigzag of output video if the ModelParams.eval is set as True
     for view_t1, view_t2 in zip(views[:-1], views[1:]):
         R1 = view_t1.R
         T1 = view_t1.T # t part of w2c
@@ -99,7 +123,7 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
             R = c2w[:3, :3]
             T = w2c[:3, 3]
             i_cam = Camera(colmap_id=view_t1.colmap_id, 
-                                    R=R,  T=T, 
+                                    R=R, T=T, 
                                     FoVx=view_t1.FoVx, FoVy=view_t1.FoVy, 
                                     K=view_t1.K, 
                                     image=view_t1.original_image,
@@ -113,8 +137,8 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
                                )
             interp_views.append(i_cam) 
 
-
-    for i, (rx, rz, tz) in enumerate(cam_aug_params):
+    # for i, (rx, rz, tz) in enumerate(cam_aug_params):
+    for i, (rx, ry, rz, tx, ty, tz) in enumerate(cam_aug_params):
         vid_images = []
         for idx, viewpoint in enumerate(tqdm(interp_views, desc="Rendering progress")):
             # Interpolate bounding-box
@@ -158,23 +182,26 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
                         S = s_cur + (s_next - s_cur) * interp_idx/(num_interp)
                         interp_bboxes[cur_frame][k].box2world[:3, :3] = torch.matmul(torch.from_numpy(R).cuda(), S)
                         interp_bboxes[cur_frame][k].box2world[:3, 3] = T.cuda()
-
-            image, image_full = render_novelview_image(viewpoint, interp_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, rz, tz)
+            with torch.no_grad():
+                # image, image_full = render_novelview_image(viewpoint, interp_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, rz, tz)
+                image, image_full = render_novelview_image_full(viewpoint, interp_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, ry, rz, tx, ty, tz)
             if image_full is not None:
                 vid_images.append(image_full.detach().cpu())
             else:
                 vid_images.append(image.detach().cpu())
         vid_images = (torch.clip(torch.stack(vid_images), 0, 1) * 255).to(torch.uint8).permute(0, 2, 3, 1)
         _, h, w, _ = vid_images.shape
-        save_video(vid_images, os.path.join(render_path, f"render_{rx}_{rz}_{tz}.mp4"))
-        
+        # save_video(vid_images, os.path.join(render_path, f"render_{rx}_{rz}_{tz}.mp4"))
+        save_video(vid_images, os.path.join(render_path, f"render_{rx}_{ry}_{rz}_{tx}_{ty}_{tz}.mp4"))
+        # the rendered is cropped for better visualization without floaters
         if i == 0 or i ==3:
             vid_images_2 = vid_images[:, :, w//4:3*w//4, :]
         elif i == 1:
             vid_images_2 = vid_images[:, :, w//2:, :]
         else:
             vid_images_2 = vid_images[:, :, :w//2, :]
-        save_video(vid_images_2, os.path.join(render_path, f"render_{rx}_{rz}_{tz}_v2.mp4"))
+        # save_video(vid_images_2, os.path.join(render_path, f"render_{rx}_{rz}_{tz}_v2.mp4"))
+        save_video(vid_images_2, os.path.join(render_path, f"render_{rx}_{ry}_{rz}_{tx}_{ty}_{tz}_v2.mp4"))
 
     res_lr = 200
     half_res_lr = res_lr // 2
@@ -199,7 +226,10 @@ def render_set(model_path, name, iteration, views, scene, pipe, background):
         vid_images = []
         for idx, viewpoint in enumerate(tqdm(interp_views, desc="Rendering progress")):
             rx, rz, tz = cam_aug_params[idx % len(cam_aug_params)]
-            image, image_full = render_novelview_image(viewpoint, all_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, rz, tz)
+            # rx, ry, rz, tx, ty, tz = cam_aug_params[idx % len(cam_aug_params)]
+            with torch.no_grad():
+                image, image_full = render_novelview_image(viewpoint, interp_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, rz, tz)
+                # image, image_full = render_novelview_image_full(viewpoint, interp_bboxes, scene.gaussians, pipe, background, ["car"], scene, rx, ry, rz, tx, ty, tz)
             if image_full is not None:
                 vid_images.append(image_full.detach().cpu())
             else:
@@ -221,12 +251,11 @@ def save_video(images, outputfile, fps=30):
     images = images.numpy() 
     for image in images:
         outputVideo.write(image[..., ::-1])  
-
     outputVideo.release() #close the writer
-
     return None
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, cfg_kitti : KITTI360DataParams, cfg_box: BoxModelParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, 
+                cfg_kitti : KITTI360DataParams, cfg_box: BoxModelParams, skip_train : bool, skip_test : bool):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
         # dataset.eval=True
@@ -234,6 +263,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        # here the train images are used to generate the new view render, the test images are ok but the length is too short
+        # here the dataset 'instant scene' is inserted in the function for getting the bbox of dynamic objeects
         render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTrainCameras(), scene, pipeline, background)
 
 if __name__ == "__main__":
@@ -253,4 +284,5 @@ if __name__ == "__main__":
 
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), dp.extract(args), bp.extract(args), args.skip_train, args.skip_test)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), 
+                dp.extract(args), bp.extract(args), args.skip_train, args.skip_test)

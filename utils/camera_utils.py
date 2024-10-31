@@ -8,12 +8,14 @@
 #
 # For inquiries contact  george.drettakis@inria.fr
 #
+import os
+
+import numpy as np
+from tqdm import tqdm
 
 from scene.cameras import Camera
-import numpy as np
-from utils.general_utils import PILtoTorch, Normal2Torch
+from utils.general_utils import Normal2Torch, PILtoTorch
 from utils.graphics_utils import fov2focal
-from tqdm import tqdm
 
 WARNED = False
 
@@ -63,7 +65,7 @@ def loadCam(args, id, cam_info, resolution_scale):
 
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, K=cam_info.K, 
-                  image=gt_image, gt_alpha_mask=loaded_mask, frame=cam_info.frame,
+                  image=gt_image, gt_alpha_mask=loaded_mask, mask=None, frame=cam_info.frame,
                   image_name=cam_info.image_name, image_path=cam_info.image_path, uid=id,
                   normal_path=cam_info.normal_path, normal=normal, 
                   image_width=image_width, image_height=image_height,
@@ -77,7 +79,65 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
 
     return camera_list
 
+def loadCam_raw(args, id, cam_info, resolution_scale):
+    orig_w, orig_h = cam_info.image.size
+    # 1248 is the fixed resolution of images
+    if args.resolution in [1, 2, 4, 8]:
+        resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
+    else:  # should be a type that converts to float
+        if args.resolution == -1:
+            if orig_w > 1600:
+                global WARNED
+                if not WARNED:
+                    print("[ INFO ] Encountered quite large input images (>1.6K pixels width), rescaling to 1.6K.\n "
+                        "If this is not desired, please explicitly specify '--resolution/-r' as 1")
+                    WARNED = True
+                global_down = orig_w / 1600
+            else:
+                global_down = 1
+        else:
+            global_down = orig_w / args.resolution
 
+        scale = float(global_down) * float(resolution_scale)
+        resolution = (int(orig_w / scale), int(orig_h / scale))
+
+    resized_image_rgb = PILtoTorch(cam_info.image, resolution)
+
+    # gt_image is the raw image loaded
+    gt_image = resized_image_rgb[:3, ...] # CHW
+
+    loaded_mask = None
+    mask = None
+    # extra mask, but this might include error at different resolution
+    if os.path.exists(cam_info.mask_path):
+        mask = np.load(cam_info.mask_path)
+        # mask = ~mask # for 4season mask
+        if mask.ndim > 2: # specifically work for MLS mask squeeze
+            mask = mask[:, :, 0]
+
+    if resized_image_rgb.shape[1] == 4:
+        loaded_mask = resized_image_rgb[3:4, ...]
+
+    # set K matrix
+    K = np.eye(3)
+    K[0, 0] = cam_info.f_x
+    K[1, 1] = cam_info.f_y
+    K[0, 2] = cam_info.c_x
+    K[1, 2] = cam_info.c_y
+    return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+                  FoVx=cam_info.FovX, FoVy=cam_info.FovY, K=K,
+                  image=gt_image, gt_alpha_mask=loaded_mask, mask=mask, frame=None,
+                  image_name=cam_info.image_name, image_path=cam_info.image_path, uid=id, 
+                  normal_path=None, normal=None,
+                  data_device=args.data_device)
+
+def cameraList_from_camInfos_raw(cam_infos, resolution_scale, args):
+    camera_list = []
+
+    for id, c in enumerate(cam_infos):
+        camera_list.append(loadCam_raw(args, id, c, resolution_scale))
+
+    return camera_list
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))

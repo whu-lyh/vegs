@@ -125,9 +125,7 @@ def best_quaternion_new(quaternion_new, idx_accum_quat):
     return quaternion_new[:, 0, :]
 
 @torch.no_grad()
-def initialize_gaussians_with_window_normals(gaussians, scene, pipe, background):
-    print(__name__)    
-    
+def initialize_gaussians_with_window_normals(gaussians, scene, pipe, background, compute_grad_cov2d=False, ret_pts=False):
     # validataion
     ptr_gs_rot = gaussians._rotation.data_ptr
     ptr_gs_scale = gaussians._scaling.data_ptr
@@ -172,11 +170,14 @@ def initialize_gaussians_with_window_normals(gaussians, scene, pipe, background)
                 sh_degree=gaussians.active_sh_degree,
                 campos=viewpoint_cam.camera_center,
                 prefiltered=False,
-                debug=pipe.debug
+                debug=pipe.debug,
+                compute_grad_cov2d=compute_grad_cov2d, # iComMa
+                proj_k=viewpoint_cam.projection_matrix, # iComMa
+                ret_pts=ret_pts
             )
 
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-            visibility_mark =rasterizer.markVisible(gaussians.get_xyz) # visibility_mark.shape: torch.Size([2370245])
+            visibility_mark = rasterizer.markVisible(gaussians.get_xyz) # visibility_mark.shape: torch.Size([2370245])
                     
             visible_xyz = (gaussians.get_xyz[visibility_mark]).unsqueeze(dim=-1)
             R = torch.from_numpy(viewpoint_cam.R).transpose(-1, -2).to(device=visible_xyz.device).type_as(visible_xyz) # world 2 cam

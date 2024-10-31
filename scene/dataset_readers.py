@@ -9,35 +9,46 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import torch, torchvision
-import os
-import sys
-from PIL import Image
-from typing import NamedTuple
-from scene.colmap_loader import read_extrinsics_text, read_intrinsics_text, qvec2rotmat, \
-    read_extrinsics_binary, read_intrinsics_binary, read_points3D_binary, read_points3D_text
-from utils.graphics_utils import getWorld2View2, focal2fov, fov2focal
-import numpy as np
 import json
-from pathlib import Path
-from plyfile import PlyData, PlyElement
-from utils.sh_utils import SH2RGB
-from utils.graphics_utils import BasicPointCloud, DynamicPointCloud
-from scene.kitti_loader import tracking_calib_from_txt, get_poses_calibration, \
-    invert_transformation, get_camera_poses_tracking, get_obj_pose_tracking, get_scene_images, \
-    bilinear_interpolate_numpy, bbox_rect_to_lidar, boxes_to_corners_3d, is_within_3d_box, points_to_canonical
-import shutil
-
-from glob import glob
-from tqdm import tqdm
 import math
-import torch.nn.functional as F
-from model import BoxModel
-import open3d as o3d
+import os
+import shutil
+import sys
+from glob import glob
+from pathlib import Path
+from typing import NamedTuple
 
-from kitti360scripts.helpers.project import CameraPerspective as KITTICameraPerspective
-from kitti360scripts.devkits.commons.loadCalibration import loadPerspectiveIntrinsic
-from kitti360scripts.helpers.annotation import Annotation3D, local2global, KITTI360Bbox3D
+import laspy
+import numpy as np
+import open3d as o3d
+import torch
+import torch.nn.functional as F
+import torchvision
+from kitti360scripts.devkits.commons.loadCalibration import \
+    loadPerspectiveIntrinsic
+from kitti360scripts.helpers.annotation import (Annotation3D, KITTI360Bbox3D,
+                                                local2global)
+from kitti360scripts.helpers.project import \
+    CameraPerspective as KITTICameraPerspective
+from PIL import Image
+from plyfile import PlyData, PlyElement
+from tqdm import tqdm
+
+from model import BoxModel
+from scene.colmap_loader import (qvec2rotmat, read_extrinsics_binary,
+                                 read_extrinsics_text, read_intrinsics_binary,
+                                 read_intrinsics_text, read_points3D_binary,
+                                 read_points3D_text)
+from scene.kitti_loader import (bbox_rect_to_lidar, bilinear_interpolate_numpy,
+                                boxes_to_corners_3d, get_camera_poses_tracking,
+                                get_obj_pose_tracking, get_poses_calibration,
+                                get_scene_images, invert_transformation,
+                                is_within_3d_box, points_to_canonical,
+                                tracking_calib_from_txt)
+from utils.graphics_utils import (BasicPointCloud, DynamicPointCloud,
+                                  focal2fov, fov2focal, getWorld2View2)
+from utils.sh_utils import SH2RGB
+
 
 class CompactCameraInfo(NamedTuple):
     uid: int
@@ -59,6 +70,7 @@ class CameraInfo(NamedTuple):
     normal_path: str
     image_path: str
     image_name: str
+    mask_path: str # lyh
     width: int
     height: int
     frame: int 
@@ -66,6 +78,24 @@ class CameraInfo(NamedTuple):
     FovY: np.array
     FovX: np.array
     K: np.array
+
+class CameraInfo_raw(NamedTuple):
+    uid: int
+    R: np.array
+    T: np.array
+    FovY: np.array
+    FovX: np.array
+    image: np.array
+    image_path: str
+    mask_path: str # lyh
+    image_name: str
+    width: int
+    height: int
+    f_x: float # lyh
+    f_y: float # lyh
+    c_x: float # lyh
+    c_y: float # lyh
+
 
 class CompacterSceneInfo(NamedTuple):
     train_cameras: list
@@ -112,9 +142,7 @@ def getNerfppNorm(cam_info, pcd=None):
 
     return {"translate": translate, "radius": radius}
 
-
-
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, mask_path):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -147,10 +175,214 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
 
-        cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+        cam_info = CameraInfo_raw(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                image_path=image_path, image_name=image_name, width=width, height=height, mask_path=mask_path,
+                                f_x=intr.params[0], f_y=intr.params[1], c_x=intr.params[2], c_y=intr.params[3]) # lyh
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
+    return cam_infos
+
+def readColmapCameras_MLS(cam_extrinsics, cam_intrinsics, images_folder, mask_path):
+    cam_infos = []
+    for idx, key in enumerate(cam_extrinsics):
+        sys.stdout.write('\r')
+        # the exact output you're looking for:
+        sys.stdout.write("Reading camera {}/{}".format(idx+1, len(cam_extrinsics)))
+        sys.stdout.flush()
+
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+
+        uid = intr.id
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+
+        if intr.model=="SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            FovY = focal2fov(focal_length_x, height)
+            FovX = focal2fov(focal_length_x, width)
+        elif intr.model=="PINHOLE":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            FovY = focal2fov(focal_length_y, height)
+            FovX = focal2fov(focal_length_x, width)
+        else:
+            assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
+
+        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_name = os.path.basename(image_path).split(".")[0]
+        image = Image.open(image_path)
+
+        # check if there is a mask based on image name
+        mask_path2 = ""
+        if mask_path != "":
+            mask_path2 = mask_path
+            image_id = image_name.split("_")[-1]
+            if image_id == "0" or image_id == "f":
+                mask_path2 = os.path.join(mask_path, "mask_car_front.npy")
+            elif image_id == "2" or image_id == "b":
+                mask_path2 = os.path.join(mask_path, "mask_car_behind.npy")
+            else:
+                mask_path2 = ""
+
+        cam_info = CameraInfo_raw(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                                image_path=image_path, image_name=image_name, width=width, height=height, mask_path=mask_path2,
+                                f_x=intr.params[0], f_y=intr.params[1], c_x=intr.params[2], c_y=intr.params[3]) # lyh
+        cam_infos.append(cam_info)
+    sys.stdout.write('\n')
+    return cam_infos
+
+def rotation_matrix_x(angle):
+    """Returns the rotation matrix for a rotation around the x-axis."""
+    cos_angle = np.cos(np.radians(angle))
+    sin_angle = np.sin(np.radians(angle))
+    return np.array([
+        [1, 0, 0],
+        [0, cos_angle, -sin_angle],
+        [0, sin_angle, cos_angle]
+    ])
+
+# 定义一个函数来计算绕y轴旋转的矩阵
+def rotation_matrix_y(angle):
+    """Returns the rotation matrix for a rotation around the y-axis."""
+    cos_angle = np.cos(np.radians(angle))
+    sin_angle = np.sin(np.radians(angle))
+    return np.array([
+        [cos_angle, 0, -sin_angle],
+        [0, 1, 0],
+        [sin_angle, 0, cos_angle]
+    ])
+    
+# 定义一个函数来计算绕z轴旋转的矩阵
+def rotation_matrix_z(angle):
+    """Returns the rotation matrix for a rotation around the z-axis."""
+    cos_angle = np.cos(np.radians(angle))
+    sin_angle = np.sin(np.radians(angle))
+    return np.array([
+        [cos_angle, -sin_angle, 0],
+        [sin_angle, cos_angle, 0],
+        [0, 0, 1]
+    ])
+
+def get_R_from_line(cam_angle, angle_offset=np.asarray([0, 0, 0])):
+    roll, pitch, yaw = cam_angle + angle_offset
+    R = np.dot(rotation_matrix_z(90-yaw), \
+        np.dot(rotation_matrix_x(roll), \
+               rotation_matrix_y(pitch)))
+    return R.T
+
+# 对每一行数据，纠正相机曝光中心与GPS之间的Offset
+# 输出的 offset 是世界坐标系的
+def get_xyz_offset(cam_angle, xyz_offset):
+    # delta_roll, delta_pitch, delta_heading = angle_offset
+    roll, pitch, yaw = cam_angle  
+    roll = np.radians(roll) # 将角度转换为弧度
+    pitch = np.radians(-pitch)
+    yaw = np.radians(-yaw + 90)
+
+    R_pitch = np.array([
+        [1, 0, 0],
+        [0, np.cos(pitch), -np.sin(pitch)],
+        [0, np.sin(pitch), np.cos(pitch)]
+    ])
+    R_roll = np.array([
+        [np.cos(roll), 0, np.sin(roll)],
+        [0, 1, 0],
+        [-np.sin(roll), 0, np.cos(roll)]
+    ])
+    R_yaw = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0],
+        [np.sin(yaw), np.cos(yaw), 0],
+        [0, 0, 1]
+    ])
+    
+    # 最终旋转矩阵为 R = R_yaw * R_pitch * R_roll
+    R = np.dot(R_yaw, np.dot(R_pitch, R_roll))
+
+    # 定义偏移向量，这里假设偏移是沿着相机的前向Z轴
+    adjusted_offset = np.dot(R, xyz_offset)
+    return adjusted_offset
+
+def get_pose(image_name, cam_infos, need_eular=False, dataset_name="nanjing"):
+    if dataset_name == "whu3d":
+        cam_id = image_name[:4]
+        cam_info = cam_infos[str(cam_id)]
+    elif dataset_name == "nanjing":
+        cam_id = image_name[:-2]
+        cam_info = cam_infos[cam_id]
+    cam_coord = np.array([float(cam_info[0]), float(cam_info[1]), float(cam_info[2])])  ## calibration has been added
+    cam_angle = np.array([float(cam_info[3]), float(cam_info[4]), float(cam_info[5])])
+
+    # 偏移量
+    offset = np.asarray([0,0,0.45,-0.35,0.15,-1.2])
+    xyz_offset = offset[:3]
+    angle_offset = offset[3:]
+    
+    rot_mat = get_R_from_line(cam_angle + angle_offset) # 世界 -> 相机
+
+    # 绕坐标轴转转
+    R_x = rotation_matrix_x(-90) # 侧面4个视图需要
+    
+    if image_name[-1] == 'l':
+        R_y = rotation_matrix_y(0) # 0度是 left
+    elif image_name[-1] == 'b':
+        R_y = rotation_matrix_y(90) # 90度是 back
+    elif image_name[-1] == 'r':
+        R_y = rotation_matrix_y(180) # 180度是 right
+    elif image_name[-1] == 'f':
+        R_y = rotation_matrix_y(270) # 270度是 front
+    else:
+        assert False, "武汉数据集图片不合法!"
+
+    # 统一旋转
+    R = np.transpose(rot_mat).dot(R_x).dot(R_y)
+    
+    # xyz的w_offset
+    xyz_offset_w = get_xyz_offset(cam_angle+angle_offset, xyz_offset)
+    cam_coord += xyz_offset_w
+    
+    if need_eular:
+        return R, cam_coord, cam_angle+angle_offset
+    else:
+        return R, cam_coord
+
+def readColmapCameras_MLS_Raw(cam_extrinsics, cam_intrinsics, images_folder, mask_path):
+    keys = cam_extrinsics[:, 0]
+    values = cam_extrinsics[:, 1:]
+    poses_info = {key.zfill(17): value for key, value in zip(keys, values)}
+    cam_infos = []
+
+    # grob images
+    for filename in os.listdir(images_folder):
+        image_path = os.path.join(images_folder, filename)
+        image = Image.open(image_path)
+        # intr = cam_intrinsics[idx]
+        height = 1304 #intr.height
+        width = 1304 #intr.width
+
+        uid = 1#intr.id
+        image_name = os.path.basename(image_path).split(".")[0]
+        r_w2c, t_w, _ = get_pose(image_name, poses_info, need_eular=True)
+        t_c = -t_w.dot(r_w2c)
+
+        # check if there is a mask based on image name
+        mask_path2 = ""
+        if mask_path != "":
+            mask_path2 = mask_path
+            image_id = image_name.split("_")[-1]
+            if image_id == "0" or image_id == "f":
+                mask_path2 = os.path.join(mask_path, "mask_car_front.npy")
+            elif image_id == "2" or image_id == "b":
+                mask_path2 = os.path.join(mask_path, "mask_car_behind.npy")
+            else:
+                mask_path2 = ""
+
+        cam_info = CameraInfo_raw(uid=uid, R=r_w2c, T=t_c, FovY=np.radians(90), FovX=np.radians(90), image=image,
+                                image_path=image_path, image_name=image_name, width=width, height=height, mask_path=mask_path2,
+                                f_x=652, f_y=652, c_x=652, c_y=652) # lyh
+        cam_infos.append(cam_info)
     return cam_infos
 
 def readKITTI3DAnnotations(path, seq, cfg_box):
@@ -210,15 +442,10 @@ def readKITTI3603DAnnotations(path, seq, cfg_box, start_frame=None, end_frame=No
             bboxes[timestamp][inst] = boxmodel
             
             inst_info.append(inst)
-            
-    
     return bboxes, list(set(inst_info))
-
 
 def readKITTI360Cameras(path, seq, start_frame=None, end_frame=None, preload_image=False, cache_dir=None):
     kitti_cams = [KITTICameraPerspective(path, seq=seq, cam_id=0), KITTICameraPerspective(path, seq=seq, cam_id=1)]
-
-
     assert np.all(kitti_cams[0].frames == kitti_cams[1].frames), "cam_0 and cam_1 frames don't match! please check."
     frames = sorted(list(kitti_cams[0].frames))
     # Subsample frames that correspond to the stacked pointcloud range
@@ -263,7 +490,7 @@ def readKITTI360Cameras(path, seq, start_frame=None, end_frame=None, preload_ima
 
             # Load image
             image_name = f'{str(int(frame)).zfill(10)}.png'
-            image_path = os.path.join(path, "data_2d_raw", seq, f"image_{str(cam_idx).zfill(2)}", "data_rect", image_name)
+            image_path = os.path.join(path, "data_2d_rect_raw", seq, f"image_{str(cam_idx).zfill(2)}", "data_rect", image_name)
             if preload_image:
                 image = Image.open(image_path)
             else:
@@ -274,7 +501,6 @@ def readKITTI360Cameras(path, seq, start_frame=None, end_frame=None, preload_ima
                         os.makedirs(os.path.dirname(image_path_cache), exist_ok=True)
                         shutil.copy(image_path, image_path_cache)
                         image_path = image_path_cache
-
 
             # Load normal
             normal_path = os.path.join(path, "data_2d_normal_omnidata_all", seq, f"image_{str(cam_idx).zfill(2)}", image_name.split('.')[0] + '_norm.npy')            
@@ -289,9 +515,8 @@ def readKITTI360Cameras(path, seq, start_frame=None, end_frame=None, preload_ima
                         shutil.copy(normal_path, normal_path_cache)
                         normal_path = normal_path_cache
 
-            
             cam_info = CameraInfo(uid=uid, R=R, T=T, image=image, FovX=FovX, FovY=FovY, 
-                                  image_path=image_path, image_name=image_name, 
+                                  image_path=image_path, image_name=image_name, mask_path="",
                                   normal_path=normal_path, normal=normal,
                                   width=w, height=h, K=K, frame=frame, cam_idx=cam_idx)
             cam_infos.append(cam_info)
@@ -364,7 +589,6 @@ def fetchDynamicPlyKITTI360(path, semantic_ids=[26], visible_only=True):
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
     instances = vertices['instance']
     timestamps = vertices['timestamp']
-    
 
     if visible_only:
         semantics = vertices['semantic']
@@ -382,8 +606,9 @@ def fetchDynamicPlyKITTI360(path, semantic_ids=[26], visible_only=True):
 def fetchPlyKITTI360(path, visible_only=True, exclude_lidar=False, exclude_colmap=True, colmap_data_type=''):
 
     all_positions = []
-    all_colors = [] 
+    all_colors = []
     if not exclude_lidar:
+        print("Load point clouds from LiDAR")
         # Fetch velodyne
         plydata = PlyData.read(path)
         vertices = plydata['vertex']
@@ -401,6 +626,7 @@ def fetchPlyKITTI360(path, visible_only=True, exclude_lidar=False, exclude_colma
     colmap_ply_path = os.path.join(colmap_path, "points3D.ply")
     
     if not exclude_colmap:
+        print("Load point clouds from Colmap")
         assert os.path.exists(colmap_ply_path), "Colmap ply file not found!"
         colmap_pcd = fetchPly(colmap_ply_path, return_normals=False)
         all_positions.append(colmap_pcd.points)
@@ -409,6 +635,22 @@ def fetchPlyKITTI360(path, visible_only=True, exclude_lidar=False, exclude_colma
     all_colors = np.concatenate(all_colors, axis=0)
 
     return BasicPointCloud(points=all_positions, colors=all_colors)
+
+def buildPLYfromLiDAR(path):
+    plydata = PlyData.read(path)
+    vertices = plydata['vertex']
+    positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+    num_points = positions.shape[0]
+    colors = np.zeros((num_points, 3), dtype=np.float32)  # RGB all set to 0.0
+    normals = np.ones((num_points, 3), dtype=np.float32)  # normals all set to 1.0
+    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+def buildPLYfromLiDAR_las(filepath, OFFSET=np.array([0, 0, 0])):
+    las = laspy.read(filepath)
+    positions = np.stack((las.x, las.y, las.z), axis=1) - OFFSET
+    colors = np.stack((las.red, las.green, las.blue), axis=1) / 255.0 / 255.0
+    normals = np.ones_like(positions)
+    return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def fetchPly(path, return_normals=True):
     plydata = PlyData.read(path)
@@ -439,7 +681,6 @@ def storeDynamicPly(path, xyz, rgb, instance, timestamp):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
     return ply_data
-
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -472,7 +713,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    # mask # lyh
+    mask_path = os.path.join(path, "sparse", "cam0_mask.npy")
+    if not os.path.exists(mask_path):
+        mask_path= ""
+    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir), mask_path=mask_path)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:
@@ -484,25 +730,194 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/0/points3D.ply")
-    bin_path = os.path.join(path, "sparse/0/points3D.bin")
-    txt_path = os.path.join(path, "sparse/0/points3D.txt")
-    if not os.path.exists(ply_path):
-        print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+    # check if there is lidar point cloud available # lyh
+    lidar_path = os.path.join(path, "sparse/lidar/points3D.ply")
+    if os.path.exists(lidar_path):
+        print("Loading the LiDAR point clouds")
+        pcd = buildPLYfromLiDAR(lidar_path)
+        ply_path = lidar_path
+    else:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            # store the enhanced ply file
+            storePly(ply_path, xyz, rgb)
+        # reload the enhanced ply file
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            pcd = fetchPly(ply_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-    try:
-        pcd = fetchPly(ply_path)
-    except:
-        pcd = None
+            pcd = None
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           dyn_point_cloud=None, # to make it compatiable with synthetic dataset
+                           train_bboxes=None, # to make it compatiable with synthetic dataset
+                           test_bboxes=None, # to make it compatiable with synthetic dataset
+                           instances_info=None) # to make it compatiable with synthetic dataset
+    return scene_info
+
+def readColmapSceneInfo_MLS(path, images, eval, llffhold=8):
+    try:
+        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
+        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
+        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    except:
+        cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.txt")
+        cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.txt")
+        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+
+    reading_dir = "images" if images == None else images
+    # mask # lyh
+    mask_path = os.path.join(path, "masks") # for car masks
+    if not os.path.exists(mask_path):
+        mask_path= ""
+    else:
+        print("Mask dir detected")
+
+    cam_infos_unsorted = readColmapCameras_MLS(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir), mask_path=mask_path)
+    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    print("The number of total images: ", len(cam_infos))
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    # check if there is lidar point cloud available # lyh
+    lidar_path = os.path.join(path, "sparse/lidar/points3D.ply")
+    if os.path.exists(lidar_path):
+        print("Loading the LiDAR point clouds")
+        pcd = buildPLYfromLiDAR(lidar_path)
+        ply_path = lidar_path
+    else:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            # store the enhanced ply file
+            storePly(ply_path, xyz, rgb)
+        # reload the enhanced ply file
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+
+    # nerf_normalization = getNerfppNorm(train_cam_infos)
+    mean_xyz = np.mean(pcd.points, axis=0)
+    norm_points = pcd.points - mean_xyz
+    distance = np.linalg.norm(norm_points, axis=1)
+    nerf_normalization = {
+        'translate': mean_xyz,
+        'radius': distance.max()
+    }
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           dyn_point_cloud=None, # to make it compatiable with synthetic dataset
+                           train_bboxes=None, # to make it compatiable with synthetic dataset
+                           test_bboxes=None, # to make it compatiable with synthetic dataset
+                           instances_info=None) # to make it compatiable with synthetic dataset
+    return scene_info
+
+def readColmapSceneInfo_MLS_Raw(path, images, eval, llffhold=8):
+    try:
+        cameras_extrinsic_file = os.path.join(path, "poses", "INSPose.dd")
+        cameras_intrinsic_file = os.path.join(path, "poses", "cameras.bin")
+        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
+    except:
+        cameras_extrinsic_file = os.path.join(path, "poses", "INSPose.txt")
+        cameras_intrinsic_file = os.path.join(path, "poses", "cameras.txt")
+        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    cam_extrinsics = np.loadtxt(cameras_extrinsic_file, usecols=(0, 3, 4, 5, 8, 9, 10), delimiter=' ', dtype='str')
+
+    reading_dir = "images" if images == None else images
+    # mask # lyh
+    mask_path = os.path.join(path, "masks") # for car masks
+    if not os.path.exists(mask_path):
+        mask_path= ""
+    else:
+        print("Mask dir detected")
+
+    cam_infos_unsorted = readColmapCameras_MLS_Raw(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, 
+                                           images_folder=os.path.join(path, reading_dir), mask_path=mask_path)
+    # cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    cam_infos = cam_infos_unsorted.copy()
+    print("The number of total images: ", len(cam_infos))
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    # check if there is lidar point cloud available # lyh
+    lidar_path = os.path.join(path, "lidar/points3D-ds.las")
+    if os.path.exists(os.path.join(path, "lidar/points3D-ds.las")):
+        print("Loading the subsampled LiDAR point clouds from las")
+        pcd = buildPLYfromLiDAR_las(lidar_path)
+        ply_path = lidar_path
+    elif os.path.exists(os.path.join(path, "lidar/points3D.las")):
+        lidar_path = os.path.join(path, "lidar/points3D.las")
+        print("Loading the LiDAR point clouds from las")
+        pcd = buildPLYfromLiDAR_las(lidar_path)
+        ply_path = lidar_path
+    else:
+        ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
+        if not os.path.exists(ply_path):
+            print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+            try:
+                xyz, rgb, _ = read_points3D_binary(bin_path)
+            except:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            # store the enhanced ply file
+            storePly(ply_path, xyz, rgb)
+        # reload the enhanced ply file
+        try:
+            pcd = fetchPly(ply_path)
+        except:
+            pcd = None
+
+    # nerf_normalization = getNerfppNorm(train_cam_infos)
+    mean_xyz = np.mean(pcd.points, axis=0)
+    norm_points = pcd.points - mean_xyz
+    distance = np.linalg.norm(norm_points, axis=1)
+    nerf_normalization = {
+        'translate': mean_xyz,
+        'radius': distance.max()
+    }
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path,
+                           dyn_point_cloud=None, # to make it compatiable with synthetic dataset
+                           train_bboxes=None, # to make it compatiable with synthetic dataset
+                           test_bboxes=None, # to make it compatiable with synthetic dataset
+                           instances_info=None) # to make it compatiable with synthetic dataset
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -542,8 +957,9 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             FovY = fovy 
             FovX = fovx
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=fovy, FovX=fovx, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+            cam_infos.append(CameraInfo_raw(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
+                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1], mask_path="",
+                            f_x=fov2focal(fovx, image.size[0]), f_y=fov2focal(fovx, image.size[0]), c_x=image.size[0]/2.0, c_y=image.size[1]/2.0)) # lyh
             
     return cam_infos
 
@@ -580,7 +996,11 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           dyn_point_cloud=None, # to make it compatiable with synthetic dataset
+                           train_bboxes=None, # to make it compatiable with synthetic dataset
+                           test_bboxes=None, # to make it compatiable with synthetic dataset
+                           instances_info=None) # to make it compatiable with synthetic dataset
     return scene_info
 
 def readKITTI360SceneInfo(path, cfg_box, eval=True, seq="2013_05_28_drive_0009_sync", 
@@ -590,15 +1010,12 @@ def readKITTI360SceneInfo(path, cfg_box, eval=True, seq="2013_05_28_drive_0009_s
     print("Reading KITTI-360 stacked static pointclouds")
     pcd_filename = os.path.join(path, "data_3d_semantics", "train", seq, "static", f"{str(int(start_frame)).zfill(10)}_{str(int(end_frame)).zfill(10)}.ply")
     pcd = fetchPlyKITTI360(pcd_filename, visible_only=visible_only, exclude_lidar=exclude_lidar, exclude_colmap=exclude_colmap, colmap_data_type=colmap_data_type)
-
     ### [1-2] Read dynamic pointclouds ###
     dyn_pcd_filename = os.path.join(path, "data_3d_semantics", "train", seq, "dynamic", f"{str(int(start_frame)).zfill(10)}_{str(int(end_frame)).zfill(10)}.ply")
     dyn_pcd = fetchDynamicPlyKITTI360(dyn_pcd_filename)
-
     ### [2] Read Annotated Cameras ###
     print("Reading KITTI-360 Cameras")
     cam_infos = readKITTI360Cameras(path, seq, start_frame, end_frame, preload_image=preload_image, cache_dir=cache_dir)
-
     ### [3] Read 3D annotations ###
     bboxes, instances_info = readKITTI3603DAnnotations(path=path, seq=seq, cfg_box=cfg_box, start_frame=start_frame, end_frame=end_frame)
     # split
@@ -608,16 +1025,12 @@ def readKITTI360SceneInfo(path, cfg_box, eval=True, seq="2013_05_28_drive_0009_s
     else:
         train_cam_infos = cam_infos
         test_cam_infos = []
-
     # split 3D annotations accordingly
     filterByKey = lambda keys, data: {x: data[x] for x in keys if x in data.keys()}
     train_bboxes = filterByKey([int(cam.frame) for cam in train_cam_infos], bboxes)
     test_bboxes = filterByKey([int(cam.frame) for cam in test_cam_infos], bboxes)
-    
     ### [4] Calculate normalizations ###
     nerf_normalization = getNerfppNorm(cam_infos, pcd)
-
-
     ### [5] Set ply storage path
     ply_dir = ".cache"
     os.makedirs(ply_dir, exist_ok=True)
@@ -644,11 +1057,7 @@ def readKITTI360SceneInfo(path, cfg_box, eval=True, seq="2013_05_28_drive_0009_s
                            train_bboxes=train_bboxes,
                            test_bboxes=test_bboxes,
                            instances_info=instances_info)
-    
-
     return scene_info 
-
-
 
 def generateRandomCameras(n_views, elevation_deg=0, camera_distance=2.0, fov=45.0, width=256, height=256):
     """
@@ -706,8 +1115,6 @@ def generateRandomCameras(n_views, elevation_deg=0, camera_distance=2.0, fov=45.
 
     return cam_infos
 
-
-
 def readKITTISceneInfo(path, cfg, cfg_box, llffhold=8, eval=True):
     seq = cfg.seq
     ### [1-1] Read PointClouds ###
@@ -727,7 +1134,6 @@ def readKITTISceneInfo(path, cfg, cfg_box, llffhold=8, eval=True):
     print("Reading KITTI_tracking 3D Annotations")
     bboxes, instances_info = readKITTI3DAnnotations(path, seq, cfg_box)
 
-
     # split
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
@@ -743,7 +1149,6 @@ def readKITTISceneInfo(path, cfg, cfg_box, llffhold=8, eval=True):
 
     ### [4] Calculate normalizations ###
     nerf_normalization = getNerfppNorm(cam_infos, pcd)
-
 
     ### [5] Set ply storage path
     ply_dir = ".cache"
@@ -779,11 +1184,11 @@ def readKITTISceneInfo(path, cfg, cfg_box, llffhold=8, eval=True):
     
     return scene_info 
 
-
-
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "KITTI360": readKITTI360SceneInfo,
-    "KITTI": readKITTISceneInfo
+    "KITTI": readKITTISceneInfo,
+    "MLS": readColmapSceneInfo_MLS,
+    "MLS_Raw": readColmapSceneInfo_MLS_Raw,
 }

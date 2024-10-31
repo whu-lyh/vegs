@@ -9,38 +9,46 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-import os
-import torch, torchvision
-from random import randint
-from utils.loss_utils import l2_loss, ssim, l1_loss, ScaleAndShiftInvariantLoss
-from gaussian_renderer import render, network_gui, render_dyn, render_all, return_gaussians_boxes_and_box2worlds
-from scene.cameras import augmentCamera
-from PIL import Image
-import sys
-from scene import Scene, GaussianModel, GaussianBoxModel
-from utils.general_utils import safe_state, Normal2Torch, check_objects_in_frame
-from utils.norminit_utils import initialize_gaussians_with_window_normals
-import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr
-from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams, KITTI360DataParams, BoxModelParams, SDRegularizationParams
-from kitti360scripts.helpers import labels as kittilabels
-import random
-import numpy as np
-from utils.graphics_utils import normal_to_rot, cam_normal_to_world_normal, standardize_quaternion, matrix_to_quaternion, quaternion_to_matrix
-from loss import loss_normal_guidance
-import wandb
-
-from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from utils.loss_utils import l2_loss
 import copy
-
-from scene.cameras import make_camera_like_input_camera
-from torch import FloatTensor, LongTensor, Tensor, Size, lerp, zeros_like
-from torch.linalg import norm
 import math
+import os
+import random
+import sys
+import uuid
+from argparse import ArgumentParser, Namespace
+from random import randint
 
+import numpy as np
+import torch
+import torchvision
+import wandb
+from diff_gaussian_rasterization import (GaussianRasterizationSettings,
+                                         GaussianRasterizer)
+from kitti360scripts.helpers import labels as kittilabels
+from PIL import Image
+from torch import FloatTensor, LongTensor, Size, Tensor, lerp, zeros_like
+from torch.linalg import norm
+from tqdm import tqdm
+
+from arguments import (BoxModelParams, KITTI360DataParams, ModelParams,
+                       OptimizationParams, PipelineParams,
+                       SDRegularizationParams)
+from gaussian_renderer import (network_gui, render, render_all, render_dyn,
+                               return_gaussians_boxes_and_box2worlds)
+from loss import LoRADiffusionRegularizer, loss_normal_guidance
+from lpipsPyTorch.modules.lpips import LPIPS
+from prune_floaters import prune_floaters
+from scene import GaussianBoxModel, GaussianModel, Scene
+from scene.cameras import (augmentCamera, make_camera_like_input_camera,
+                           make_camera_like_input_camera_full)
+from utils.general_utils import (Normal2Torch, check_objects_in_frame,
+                                 safe_state)
+from utils.graphics_utils import (cam_normal_to_world_normal,
+                                  matrix_to_quaternion, normal_to_rot,
+                                  quaternion_to_matrix, standardize_quaternion)
+from utils.image_utils import psnr
+from utils.loss_utils import ScaleAndShiftInvariantLoss, l1_loss, l2_loss, ssim
+from utils.norminit_utils import initialize_gaussians_with_window_normals
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -61,14 +69,15 @@ def seed_all(seed):
     torch.backends.cudnn.enabled = False
 
 
-def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint_dir, debug_from, dyn_obj_list=['car'], exp_note='', run=None, args=None, output_dir=None):
+def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations, saving_iterations, 
+             checkpoint_iterations, checkpoint_dir, debug_from, dyn_obj_list=['car'], 
+             exp_note='', run=None, args=None, output_dir=None, prune_sched=[]):
     seed_all(dataset.seed)
     # add start / ending iteration of diffusion guidance for test
     first_iter = 0
     unique_str = prepare_output_and_logger(dataset, cfg_kitti, exp_note, output_dir=output_dir)
     if run is not None:
         run.tags += (unique_str, )
-    
     # Set-up Gaussians
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, cfg_kitti, cfg_box)
@@ -78,7 +87,7 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     # Initialize Gaussian covariances with monocular normals
-    gaussians = initialize_gaussians_with_window_normals(gaussians, scene, pipe, background)
+    gaussians = initialize_gaussians_with_window_normals(gaussians, scene, pipe, background, compute_grad_cov2d=False, ret_pts=False)
 
     for instanceId in scene.gaussian_box_models.keys():
         scene.gaussian_box_models[instanceId].training_setup(opt)
@@ -91,14 +100,15 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
             scene.gaussian_box_models[instanceId].restore(model_params, opt)
 
     # Load diffusion regularizer
-    from loss import LoRADiffusionRegularizer
     sd_reg = LoRADiffusionRegularizer(dataset, cfg_kitti, cfg_sd, opt.iterations)
 
+    # if cfg_sd.perceptual_loss:
+    #     from loss import VGGPerceptualLoss
+    #     perceptual_loss = VGGPerceptualLoss().cuda()
 
-    if cfg_sd.perceptual_loss:
-        from loss import VGGPerceptualLoss
-        perceptual_loss = VGGPerceptualLoss().cuda()
-
+    # also used in evaluation for avoiding the model loading that cause the time consuming
+    has_lpips = False # lyh
+    lpips_loss = LPIPS('vgg', '0.1').cuda()
 
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
@@ -107,8 +117,8 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    last_prune_iter = None
    
-
     for iteration in range(first_iter, opt.iterations + 1):        
         iter_start.record()
 
@@ -138,13 +148,12 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
         
         # Retrieve GT image
         gt_image = viewpoint_cam.original_image
-        
+        # this_frame_includes_objects = False
         # Render dynamic scene 
         if this_frame_includes_objects:
             bboxes = all_bboxes[frame]
             gaussians_boxes, box_models, box2worlds = return_gaussians_boxes_and_box2worlds(bboxes, scene, insts_in_frame)
             render_pkg = render_all(viewpoint_cam, gaussians, gaussians_boxes, box2worlds, pipe, background)
-        
         # Render static scene
         else:
             render_pkg = render(viewpoint_cam, gaussians, pipe, background)
@@ -156,26 +165,26 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                                                                                        render_pkg['render_cov_quat'], \
                                                                                        render_pkg['render_cov_scale']         
 
-
-
         # Photometric loss  
         Ll1 = l1_loss(image, gt_image)
         lambda_dssim = opt.lambda_dssim
         loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim(image, gt_image))
-        
         # Normal guidance loss
-        Lng = loss_normal_guidance(viewpoint_cam, cov_quat, cov_scale)
-        loss += opt.lambda_dnormal * Lng
-
-
+        Lng = None
+        if opt.lambda_dnormal > 0:
+            Lng = loss_normal_guidance(viewpoint_cam, cov_quat, cov_scale)
+            loss += opt.lambda_dnormal * Lng
+        # lpips loss # lyh
+        if has_lpips:
+            lambda_lpips = 0.5 # 1.0 is not ok, PSNR will decrease a half of raw mode
+            loss_lpips = lpips_loss(image, gt_image).mean()
+            loss += lambda_lpips * loss_lpips
         # Diffusion guidance loss
-        if iteration > cfg_sd.start_guiding_from_iter and iteration < cfg_sd.end_guiding_at_iter:
+        if opt.lambda_dguidance > 0 and iteration > cfg_sd.start_guiding_from_iter and iteration < cfg_sd.end_guiding_at_iter:
             # [1] Augment viewpoints
             viewpoint_cam_aug, yaw, pitch, t_y, aug_dir = augmentCamera(viewpoint_cam, cfg_sd)
-            
             # [2] Render augmented viewpoints
             image_aug = render(viewpoint_cam_aug, gaussians, pipe, background)["render"]
-
             # [3] Random crop renderings from augmented view.
             h_aug, w_aug = image_aug.shape[1], image_aug.shape[2]
             if cfg_sd.global_crop:
@@ -187,14 +196,10 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                     w_crop_start = randint(0, (w_aug-h_aug) // 2)
 
             image_aug = image_aug[None, ..., w_crop_start:w_crop_start+h_aug]
-
             # [3] Compute guidance loss
             loss_guidance = sd_reg(image_aug, iteration)
             loss += loss_guidance
-
-
         loss.backward()
-
         ## Do not update nan gradients for box optimizers 
         ## TODO: Why is this happening?
         if this_frame_includes_objects:
@@ -203,8 +208,7 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                     bm.delta_r.grad = torch.zeros_like(bm.delta_r.grad)
                     bm.delta_s.grad = torch.zeros_like(bm.delta_s.grad)
                     bm.delta_t.grad = torch.zeros_like(bm.delta_t.grad)
-            
-        
+
         iter_end.record()
 
         with torch.no_grad():
@@ -216,15 +220,17 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            scalar_kwargs={}
+            scalar_kwargs = {}
             scalar_kwargs["loss"] = loss.item()
             scalar_kwargs["loss_ema"] = ema_loss_for_log
             scalar_kwargs["l1_loss"] = Ll1.item()
-            scalar_kwargs["normal_loss"] = Lng.item()
+            if opt.lambda_dnormal > 0:
+                scalar_kwargs["normal_loss"] = Lng.item()
+            if has_lpips:
+                scalar_kwargs["lpips_loss"] = loss_lpips.item()
 
-            if iteration > cfg_sd.start_guiding_from_iter and iteration < cfg_sd.end_guiding_at_iter:
+            if opt.lambda_dguidance> 0 and iteration > cfg_sd.start_guiding_from_iter and iteration < cfg_sd.end_guiding_at_iter:
                 scalar_kwargs[f"{cfg_sd.guidance_mode}_loss_guidance"] = loss_guidance.item()
-
                 # Record box refinment information 
                 deltas = []
                 if this_frame_includes_objects:
@@ -235,7 +241,6 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                     scalar_kwargs["delta_s_norm"] = deltas[1].item()
                     scalar_kwargs["delta_t_norm"] = deltas[2].item()
 
-
         # Log and save
         with torch.no_grad():
             if not args.no_wandb:
@@ -243,14 +248,16 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                 if dataset.save_results_as_images:
                     save_dir = scene.model_path
                 wandb.log(scalar_kwargs, step=iteration)
-                training_report(iteration, testing_iterations, scene, all_bboxes, gaussians, pipe, background, dyn_obj_list, cfg_sd=cfg_sd, scalar_kwargs=scalar_kwargs, save_dir=save_dir)
+                training_report(iteration, testing_iterations, scene, all_bboxes, gaussians, pipe, background, lpips_loss,
+                                dyn_obj_list, cfg_sd=cfg_sd, scalar_kwargs=scalar_kwargs, save_dir=save_dir)
         if (iteration in saving_iterations):
             print("\n[ITER {}] Saving Gaussians".format(iteration))
             scene.save(iteration)
 
         end_idx = gaussians.get_xyz.shape[0]
         cur_viewspace_point_tensor = slice_with_grad(viewspace_point_tensor, 0, end_idx)
-        densification_and_optimization(gaussians, opt, cfg_sd, iteration, cur_viewspace_point_tensor, visibility_filter[:end_idx], scene, pipe, radii[:end_idx], dataset)
+        densification_and_optimization(gaussians, background, opt, cfg_sd, iteration, prune_sched, last_prune_iter, 
+                                       cur_viewspace_point_tensor, visibility_filter[:end_idx], scene, pipe, radii[:end_idx], dataset)
         
         if this_frame_includes_objects:
             start_idx=end_idx
@@ -259,9 +266,12 @@ def training(dataset, opt, pipe, cfg_kitti, cfg_box, cfg_sd, testing_iterations,
                 idx_length = gaussians_box.get_xyz.shape[0]
                 cur_viewspace_point_tensor = slice_with_grad(viewspace_point_tensor, start_idx, start_idx+idx_length)
                 densification_and_optimization(gaussians_box, 
+                                               background, 
                                                opt,
                                                cfg_sd, 
                                                iteration, 
+                                               prune_sched, 
+                                               last_prune_iter, 
                                                cur_viewspace_point_tensor, 
                                                visibility_filter[start_idx:start_idx+idx_length], 
                                                scene, 
@@ -289,7 +299,8 @@ def slice_with_grad(tensor, start, end):
     out.grad = tensor.grad[start:end]
     return out
 
-def densification_and_optimization(gaussians, opt, cfg_sd, iteration, viewspace_point_tensor, visibility_filter, scene, pipe, radii, dataset, box=False):
+def densification_and_optimization(gaussians, background, opt, cfg_sd, iteration, prune_sched, last_prune_iter,
+                                   viewspace_point_tensor, visibility_filter, scene, pipe, radii, dataset, box=False):
     # Densification
     if box:
         condition = iteration < opt.densify_until_iter_box
@@ -319,6 +330,25 @@ def densification_and_optimization(gaussians, opt, cfg_sd, iteration, viewspace_
         gaussians.optimizer.step()
         gaussians.optimizer.zero_grad(set_to_none = True)
 
+    # lyh copy from SparseGS
+    if iteration in prune_sched:
+        os.makedirs(os.path.join(dataset.model_path, f"pruned_modes_mask_{iteration}"), exist_ok=True)
+        os.makedirs(os.path.join(dataset.model_path, f"modes_{iteration}"), exist_ok=True)
+        scene.save(iteration-1)
+        prune_floaters(scene.getTrainCameras().copy(), gaussians, pipe, background, dataset, iteration)
+        scene.save(iteration+1)
+        last_prune_iter = iteration
+    
+    if last_prune_iter is not None and \
+        not (iteration == last_prune_iter) and \
+            iteration - last_prune_iter > dataset.densify_lag and \
+                iteration - last_prune_iter < dataset.densify_period + dataset.densify_lag and \
+                    iteration % 100 == 0:                
+        gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+        gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+        gaussians.densify_and_prune(opt.densify_grad_threshold, 0.01, scene.cameras_extent, 20)
+        print('Densifying')
+
 
 def prepare_output_and_logger(args, cfg_kitti, exp_note, output_dir): 
     if not args.model_path:
@@ -327,7 +357,6 @@ def prepare_output_and_logger(args, cfg_kitti, exp_note, output_dir):
         else:
             unique_str = str(uuid.uuid4())
         args.model_path = os.path.join(output_dir, f"{cfg_kitti.seq}_{str(cfg_kitti.start_frame).zfill(10)}_{str(cfg_kitti.end_frame).zfill(10)}", f"{unique_str[0:10]}_{exp_note}")
-        
     # Set up output folder
     print("Output folder: {}".format(args.model_path))
     os.makedirs(args.model_path, exist_ok = True)
@@ -335,12 +364,36 @@ def prepare_output_and_logger(args, cfg_kitti, exp_note, output_dir):
         cfg_log_f.write(str(Namespace(**vars(args))))
     return unique_str
 
-def render_novelview_image(viewpoint, all_bboxes, gaussians, pipe, background, dyn_obj_list, scene, add_xrot_val=0, add_zrot_val=0, add_tz = 0):
+def render_novelview_image(viewpoint, all_bboxes, gaussians, pipe, background, dyn_obj_list, scene, 
+                           add_xrot_val=0, add_zrot_val=0, add_tz = 0):
     frame = viewpoint.frame
+    # check if have dynamic objects, if true, return the instance exist frame
     this_frame_includes_objects, insts_in_frame = check_objects_in_frame(frame , all_bboxes)
     
     image_full = None
-    viewpoint_new = make_camera_like_input_camera(viewpoint, add_xrot_val=add_xrot_val, add_zrot_val=add_zrot_val, add_tz = add_tz)    
+    viewpoint_new = make_camera_like_input_camera(viewpoint, add_xrot_val=add_xrot_val, add_zrot_val=add_zrot_val, add_tz=add_tz)    
+
+    if this_frame_includes_objects:
+        bboxes = all_bboxes[frame]
+        gaussians_boxes, box_models, box2worlds = return_gaussians_boxes_and_box2worlds(bboxes, scene, insts_in_frame)
+        image_full = torch.clamp(render_all(viewpoint_new, gaussians, gaussians_boxes, box2worlds, pipe, background)["render"], 0.0, 1.0)
+        image = torch.clamp(render(viewpoint_new, gaussians, pipe, background)["render"], 0.0, 1.0)
+    else: 
+        image = torch.clamp(render(viewpoint_new, gaussians, pipe, background)["render"], 0.0, 1.0)    
+
+    return image, image_full
+
+def render_novelview_image_full(viewpoint, all_bboxes, gaussians, pipe, background, dyn_obj_list, scene, 
+                           add_xrot_val=0, add_yrot_val=0, add_zrot_val=0, 
+                           add_tx = 0, add_ty = 0, add_tz = 0):
+    frame = viewpoint.frame
+    # check if have dynamic objects, if true, return the instance exist frame
+    this_frame_includes_objects, insts_in_frame = check_objects_in_frame(frame , all_bboxes)
+    
+    image_full = None
+    viewpoint_new = make_camera_like_input_camera_full(viewpoint, 
+                                                       add_xrot_val=add_xrot_val, add_yrot_val=add_yrot_val, add_zrot_val=add_zrot_val, 
+                                                       add_tx=add_tx, add_ty=add_ty, add_tz=add_tz)    
 
     if this_frame_includes_objects:
         bboxes = all_bboxes[frame]
@@ -359,7 +412,7 @@ def render_novelview_rotaxis(viewpoint, all_bboxes, gaussians, pipe, background,
     this_frame_includes_objects, insts_in_frame = check_objects_in_frame(frame, all_bboxes)
 
     cov_rot_full = None
-    _, H, W = viewpoint.original_normal.shape    
+    _, H, W = viewpoint.original_normal.shape
 
 
     viewpoint_new = make_camera_like_input_camera(viewpoint, add_xrot_val=add_xrot_val, add_zrot_val=add_zrot_val, add_tz = add_tz)    
@@ -373,8 +426,8 @@ def render_novelview_rotaxis(viewpoint, all_bboxes, gaussians, pipe, background,
         cov_scale = render(viewpoint_new, gaussians, pipe, background)["render_cov_scale"]
 
         cov_quat_full = cov_quat_full.permute(1,2,0).reshape(-1, 4).contiguous()
-        cov_rot_full = quaternion_to_matrix(cov_quat_full)                # cov_rot.shape: torch.Size([n_pix, 3, 3])
-        cov_scale_full = cov_scale_full.permute(1,2,0).reshape(-1,3).contiguous()        
+        cov_rot_full = quaternion_to_matrix(cov_quat_full) # cov_rot.shape: torch.Size([n_pix, 3, 3])
+        cov_scale_full = cov_scale_full.permute(1,2,0).reshape(-1,3).contiguous()
     else: 
         cov_quat = render(viewpoint_new, gaussians, pipe, background)["render_cov_quat"]
         cov_scale = render(viewpoint_new, gaussians, pipe, background)["render_cov_scale"]
@@ -385,7 +438,7 @@ def render_novelview_rotaxis(viewpoint, all_bboxes, gaussians, pipe, background,
 
     R_world2cam = torch.from_numpy(viewpoint.R).transpose(-1, -2).to(device=cov_rot.device).type_as(cov_rot)
     R_world2cam = R_world2cam[None] # -> 1x3x3
-    norm_like = (R_world2cam @ cov_rot) # npix x 3 x 3    
+    norm_like = (R_world2cam @ cov_rot) # npix x 3 x 3
 
     if idx_best == 'gt_like':
         idx_best = torch.argmax(torch.sum(normal_gt * norm_like, dim=1), dim=1)[:,None, None].repeat(1,3,1)    
@@ -401,12 +454,12 @@ def render_novelview_rotaxis(viewpoint, all_bboxes, gaussians, pipe, background,
 
     norm_like_best_full = None
     if this_frame_includes_objects:
-        norm_like_full = (R_world2cam @ cov_rot) # npix x 3 x 3    
+        norm_like_full = (R_world2cam @ cov_rot) # npix x 3 x 3
         idx_best = torch.argmax(torch.sum(normal_gt * norm_like_full, dim=1), dim=1)[:,None, None].repeat(1,3,1)
         norm_like_best_full = norm_like.gather(dim=2, index = idx_best).squeeze().permute(1,0)
         norm_like_best_full = ((( norm_like_best_full.reshape(-1, H, W)*-1)+1)/2)*255
         norm_like_best_full = torch.clip(norm_like_best_full, min=0, max=255)
-        norm_like_best_full = norm_like_best_full.to(torch.uint8)   
+        norm_like_best_full = norm_like_best_full.to(torch.uint8)
 
     return norm_like_best, norm_like_best_full
 
@@ -417,7 +470,7 @@ def render_novelview_bestrotaxis(viewpoint, all_bboxes, gaussians, pipe, backgro
     this_frame_includes_objects, insts_in_frame = check_objects_in_frame(frame, all_bboxes)
 
     cov_rot_full = None
-    _, H, W = viewpoint.original_normal.shape    
+    _, H, W = viewpoint.original_normal.shape
 
    
     viewpoint_new = make_camera_like_input_camera(viewpoint, add_xrot_val=add_xrot_val, add_zrot_val=add_zrot_val, add_tz = add_tz)    
@@ -439,7 +492,7 @@ def render_novelview_bestrotaxis(viewpoint, all_bboxes, gaussians, pipe, backgro
     R_world2cam = torch.from_numpy(viewpoint.R).transpose(-1, -2).to(device=cov_rot.device).type_as(cov_rot)
     R_world2cam = R_world2cam[None] # -> 1x3x3
 
-    norm_like = (R_world2cam @ cov_rot) # npix x 3 x 3    
+    norm_like = (R_world2cam @ cov_rot) # npix x 3 x 3
     idx_best = torch.argmax(torch.sum(normal_gt * norm_like, dim=1), dim=1)[:,None, None].repeat(1,3,1)
     norm_like_best = norm_like.gather(dim=2, index = idx_best).squeeze().permute(1,0)
     norm_like_best = ((( norm_like_best.reshape(-1, H, W)*-1)+1)/2)*255
@@ -448,7 +501,7 @@ def render_novelview_bestrotaxis(viewpoint, all_bboxes, gaussians, pipe, backgro
 
     norm_like_best_full = None
     if this_frame_includes_objects:
-        norm_like_full = (R_world2cam @ cov_rot) # npix x 3 x 3    
+        norm_like_full = (R_world2cam @ cov_rot) # npix x 3 x 3
         idx_best = torch.argmax(torch.sum(normal_gt * norm_like_full, dim=1), dim=1)[:,None, None].repeat(1,3,1)
         norm_like_best_full = norm_like.gather(dim=2, index = idx_best).squeeze().permute(1,0)
         norm_like_best_full = ((( norm_like_best_full.reshape(-1, H, W)*-1)+1)/2)*255
@@ -508,7 +561,8 @@ def render_novelview_rotaxis_onebyone(viewpoint, all_bboxes, gaussians, pipe, ba
     return cov_axis_list, cov_axis_full_list
 
 
-def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, gaussians, pipe, background, dyn_obj_list, cfg_sd=None, viewpoint_stack=None, scalar_kwargs=None, save_dir=None):
+def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, gaussians, pipe, background, lpips_loss,
+                    dyn_obj_list, cfg_sd=None, viewpoint_stack=None, scalar_kwargs=None, save_dir=None):
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
@@ -529,12 +583,11 @@ def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, ga
         # view down & move up 
         cam_aug_params += [[-i, 0, i/15*1.5] for i in range(10)]
 
-
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
-                
+                lpips_test = 0.0 # lyh
                 if save_dir is not None and iteration in testing_iterations:
                     viz_types = ['render_rgb', 'render_axis_min_scale', 'render_axis_gt_like', 'render_rgb_aug', 'render_rgb_aug_all']
                     viz_dirs = {}
@@ -548,15 +601,13 @@ def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, ga
                 for idx, viewpoint in tqdm(enumerate(config['cameras']), total=len(config['cameras'])):
                     wandb_cond = (idx % 10 ==0)
                     log_imgs = [] 
-
                     # add rendered image to log candidates
                     image, image_full = render_novelview_image(viewpoint, all_bboxes, gaussians, pipe, background, dyn_obj_list, scene)
                     gt_image = torch.clamp(viewpoint.original_image, 0.0, 1.0)
-                    
                     # do evaluation
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
-                    
+                    lpips_test += lpips_loss(image, gt_image).mean().double() # lyh
                     # log images
                     if save_dir is not None and iteration in testing_iterations:
                         torchvision.utils.save_image(image, os.path.join(viz_dirs['render_rgb'], viewpoint.image_name))
@@ -566,16 +617,15 @@ def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, ga
                     # add normal image to log candidates
                     gt_norm_rgb = ((viewpoint.original_normal*-1 + 1) * 0.5) * 255 
                     gt_norm_rgb = torch.clip(gt_norm_rgb, min=0, max=255)
-                    gt_norm_rgb = gt_norm_rgb.to(torch.uint8)                    
+                    gt_norm_rgb = gt_norm_rgb.to(torch.uint8)
 
-                    # add cov rot axis to log candidates                                                
+                    # add cov rot axis to log candidates
                     if save_dir is not None and iteration in testing_iterations:
                         render_axis_best, render_axis_best_full = render_novelview_rotaxis(viewpoint, all_bboxes, gaussians, pipe, background, dyn_obj_list, scene, idx_best = 'min_scale')
                         torchvision.utils.save_image(render_axis_best / 255, os.path.join(viz_dirs['render_axis_min_scale'], viewpoint.image_name))
                         if render_axis_best_full is not None:
                             torchvision.utils.save_image(render_axis_best_full / 255, os.path.join(viz_dirs['render_axis_min_scale'], f"{viewpoint.image_name[:-4]}_with_objects.png"))
  
-
                     if save_dir is not None and iteration in testing_iterations:
                         for rx, rz, tz in cam_aug_params:
                             aug_caption = f"Rx: {rx}| Rz: {rz} | tz: {tz}"
@@ -590,17 +640,20 @@ def training_report(iteration, testing_iterations, scene : Scene, all_bboxes, ga
                     if wandb_cond:
                         wandb.log({config['name'] + f"_view_{viewpoint.image_name}":log_imgs}, step=iteration)   
 
-
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-                wandb.log({ config['name'] + '/loss_viewpoint - l1_loss': l1_test, 
-                            config['name'] + '/loss_viewpoint - psnr': psnr_test}, 
+                l1_test /= len(config['cameras'])
+                lpips_test /= len(config['cameras'])       
+                print("\n[ITER {}] Evaluating {}: L1 {} PSNR {} LPIPS {}".format(iteration, config['name'], l1_test, psnr_test, lpips_test))
+                wandb.log({ config['name'] + '/loss_viewpoint - l1_loss': l1_test,
+                            config['name'] + '/loss_viewpoint - psnr': psnr_test,
+                            config['name'] + '/loss_viewpoint - lpips': lpips_test},
                             step=iteration) 
         
         torch.cuda.empty_cache()
 
 if __name__ == "__main__":
+    # personal wandb api key
+    os.environ["WANDB_API_KEY"] = '9741a4b0c64721f58cfbbc559429417ed1bfdcb9'
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
@@ -608,19 +661,20 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     dp = KITTI360DataParams(parser)
     bp = BoxModelParams(parser)
-    sp = SDRegularizationParams(parser) 
+    sp = SDRegularizationParams(parser)
 
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--exp_note', type=str, default="")
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument('--no_wandb', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[100_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[100_000])
+    parser.add_argument('--no_wandb', action='store_true', default=True)
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[50_000, 100_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[50_000, 100_000])
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[100_000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[50_000, 100_000])
     parser.add_argument("--start_checkpoint_dir", type=str, default = None)
+    parser.add_argument("--prune_sched", nargs="+", type=int, default=[2_000, 50_000, 70_000]) # prune_floaters
     args = parser.parse_args(sys.argv[1:])
 
     # initialize wandb -------------------
@@ -638,22 +692,18 @@ if __name__ == "__main__":
     else:
         run = None
     # -----------------------------------
-
-
     print("Optimizing " + args.model_path)
-
     # Initialize system state (RNG)
     safe_state(args.quiet)
-
     # Start GUI server, configure and run training
     # network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
     training(lp.extract(args), 
              op.extract(args), 
              pp.extract(args), 
-             dp.extract(args),
+             dp.extract(args), # dataset parameter
              bp.extract(args),
-             sp.extract(args), 
+             sp.extract(args), # stable diffusion parameter
              args.test_iterations, 
              args.save_iterations, 
              args.checkpoint_iterations, 
@@ -662,7 +712,7 @@ if __name__ == "__main__":
              exp_note=args.exp_note,
              run=run,
              args=args,
-             output_dir=args.output_dir)
-
+             output_dir=args.output_dir,
+             prune_sched=args.prune_sched)
     # All done
     print("\nTraining complete.")

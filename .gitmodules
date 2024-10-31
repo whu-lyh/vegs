@@ -7,3 +7,12 @@
 [submodule "submodules/diff_gaussian_rasterization"]
 	path = submodules/diff_gaussian_rasterization
 	url = https://github.com/emjay73/diff_gaussian_rasterization_with_depth.git
+[submodule "submodules/kitti360Scripts"]
+	path = submodules/kitti360Scripts
+	url = git@github.com:whu-lyh/kitti360Scripts.git
+[submodule "submodules/LightGlue"]
+	path = submodules/LightGlue
+	url = git@github.com:whu-lyh/LightGlue.git
+[submodule "submodules/Perspective-and-Equirectangular"]
+	path = submodules/Perspective-and-Equirectangular
+	url = git@github.com:whu-lyh/Perspective-and-Equirectangular.git

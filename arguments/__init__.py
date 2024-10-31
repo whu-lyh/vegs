@@ -44,6 +44,7 @@ class ParamGroup:
                 setattr(group, arg[0], arg[1])
         return group
 
+
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
         self.sh_degree = 3
@@ -54,12 +55,18 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
-        self.eval = False
+        self.eval = False # here should be false, and set true manually when building 3dgs
         self.output_dir = "./output"
         self.data_type = "kitti360"
         self.cache_dir = ""
         self.save_results_as_images = False
         self.seed = 7
+        # Floater Pruning of SparseGS
+        self.prune_exp = 3.0 # 7.0 lower is less aggresive
+        self.prune_perc = 0.999 # 0.98 higher is less aggresive
+        self.densify_lag = 1000000
+        self.power_thresh = -4.0
+        self.densify_period = 5000
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -67,12 +74,28 @@ class ModelParams(ParamGroup):
         g.source_path = os.path.abspath(g.source_path)
         return g
 
+
+class iComMaParams(ParamGroup):
+    def __init__(self, parser):
+        self.OVERLAY = False
+        self.camera_pose_lr = 0.01 # 0.01, 0.05 learning rate
+        self.lambda_LoFTR = 0.8 # 0.8 balance coefficient
+        self.confidence_threshold_LoFTR = 0.5 # 0.5 Matching points below the threshold will be discarded.
+        self.min_matching_points = 30 # The matching module will be deprecated if there are too few detected matching points.
+        self.pose_estimation_iter = 300 # Number of iterations.
+        self.deprecate_matching = False # Whether to deprecate the matching module from the beginning.
+        self.LoFTR_ckpt_path = "/workspace/WorkSpaceRec/vegs/LoFTR/ckpt/outdoor_ds.ckpt"
+        self.LoFTR_temp_bug_fix = False # set to False when using the old ckpt
+        super().__init__(parser, "iComMa Parameters")
+
+
 class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.convert_SHs_python = False
         self.compute_cov3D_python = False
         self.debug = False
         super().__init__(parser, "Pipeline Parameters")
+
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
@@ -96,8 +119,10 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter_box = 50_000 # 50_000 CHANGE
         self.densify_grad_threshold = 0.0002
         
-        self.lambda_dnormal = 1e-3 #1e-3 #1e-4 #0.001
+        self.lambda_dnormal = 0 #1e-3 #1e-4 #0.001
+        self.lambda_dguidance = 0 # switcher for if using the SD guidance
         super().__init__(parser, "Optimization Parameters")
+
 
 class KITTI360DataParams(ParamGroup):
     def __init__(self, parser):
@@ -107,7 +132,6 @@ class KITTI360DataParams(ParamGroup):
         self.exclude_lidar = False
         self.exclude_colmap = False
         self.colmap_data_type = '_processed'
-
         super().__init__(parser, "Data Parameters")
 
 
@@ -117,6 +141,7 @@ class BoxModelParams(ParamGroup):
         self.boxmodel_lambda_reg = 0.001
         self.gaussian_box_model_init_opacity = 0.1
         super().__init__(parser, "Box optimization model training Parameters")
+
 
 class SDRegularizationParams(ParamGroup):
     def __init__(self, parser):
@@ -128,7 +153,7 @@ class SDRegularizationParams(ParamGroup):
         self.global_crop = False
         
         # LoRA options
-        self.lora_model_dir = "lora/models"
+        self.lora_model_dir = "/workspace/WorkSpaceRec/vegs/lora/models"
         self.lora_checkpoint_iter = None 
         
         # Stable Diffusion options
@@ -163,8 +188,6 @@ class SDRegularizationParams(ParamGroup):
         self.perceptual_loss_lambda = 1.0
 
         super().__init__(parser, "Stable Diffusion Guidance parameters")
-
-        
 
 
 def get_combined_args(parser : ArgumentParser):

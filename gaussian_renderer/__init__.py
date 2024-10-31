@@ -17,7 +17,7 @@ from utils.sh_utils import eval_sh
 from typing import List
 from utils.graphics_utils import matrix_to_quaternion, quaternion_to_matrix, decompose_T_to_RS, quaternion_multiply
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, compute_grad_cov2d=False, ret_pts=False):
     """
     Render the scene. 
     
@@ -47,7 +47,10 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         sh_degree=pc.active_sh_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
-        debug=pipe.debug
+        debug=pipe.debug,
+        compute_grad_cov2d=compute_grad_cov2d, # iComMa
+        proj_k=viewpoint_camera.projection_matrix, # iComMa
+        ret_pts=ret_pts, # SparseGS
     )
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
@@ -82,8 +85,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             shs = pc.get_features
     else:
         colors_precomp = override_color
-
-    rendered_image, depth_image, rendered_cov_quat, rendered_cov_scale, alpha, radii = rasterizer(    
+    # emjay & lyh 
+    rendered_image, depth_image, rendered_cov_quat, rendered_cov_scale, alpha, radii, \
+        num_gauss, mode_id, modes, alpha_depth, point_list, means2D, conic_opacity = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -91,7 +95,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         opacities = opacity,
         scales = scales,
         rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
+        cov3D_precomp = cov3D_precomp,
+        camera_center = viewpoint_camera.camera_center, # iComMa
+        camera_pose = viewpoint_camera.world_view_transform) # iComMa
     # original -------------------------
     # rendered_image, radii = rasterizer(
     #     means3D = means3D,
@@ -103,15 +109,24 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     #     rotations = rotations,
     #     cov3D_precomp = cov3D_precomp)
     # ------------------------------
-    
+
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     return {"render": rendered_image, # torch.Size([3, 376, 1408]) # torch.float32
             # emjay added ---------------
-            'render_depth':  depth_image, 
+            'render_depth': depth_image, # torch.Size([1, 376, 1408])
             'render_cov_quat': rendered_cov_quat,  # torch.Size([4, 376, 1408]) # torch.float32
             'render_cov_scale': rendered_cov_scale, # torch.Size([3, 376, 1408]) # torch.float32
             'alpha': alpha, # torch.Size([1, 376, 1408]) # torch.float32
+            # ---------------------------
+            # lyh
+            "num_gauss": num_gauss,
+            "alpha_depth": alpha_depth,
+            "modes": modes,
+            "mode_id": mode_id,
+            "point_list": point_list,
+            "means2D": means2D,
+            "conic_opacity": conic_opacity,
             # ---------------------------
             "viewspace_points": screenspace_points, # torch.Size([2233571, 3]) # torch.float32
             "visibility_filter" : radii > 0, # torch.Size([2233571]) # torch.bool
