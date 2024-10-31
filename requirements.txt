@@ -1,0 +1,22 @@
+torchaudio
+torchvision
+plyfile
+tensorboard
+scipy
+open3d
+tqdm
+diffusers==0.14.0
+diptest
+transformers
+accelerate
+datasets
+wandb
+numpy-quaternion
+opencv-python
+einops==0.3.0
+kornia>=0.6.11
+yacs>=0.1.8
+timm==0.6.12
+imageio
+h5py
+pytorch_lightning # depth estimation required
