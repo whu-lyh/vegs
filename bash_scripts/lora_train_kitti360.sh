@@ -2,7 +2,7 @@ export CUDA_VISIBLE_DEVICES=${1:-0}
 MODEL_NAME="stabilityai/stable-diffusion-2-1-base"
 SEED=1337
 
-python -m accelerate.commands.launch --mixed_precision="fp16"  lora/scripts/train_text_to_image_lora_kitti360.py \
+HF_ENDPOINT=https://hf-mirror.com python -m accelerate.commands.launch --mixed_precision="fp16"  ../lora/scripts/train_text_to_image_lora_kitti360.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --dataloader_num_workers=8 \
   --resolution=512 --center_crop --random_flip \

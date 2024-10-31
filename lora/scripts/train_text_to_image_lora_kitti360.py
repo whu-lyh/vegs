@@ -50,6 +50,12 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+import sys
+
+base_path = os.path.dirname(os.path.dirname(os.path.dirname((os.path.abspath(__file__)))))
+print(base_path)
+if base_path not in sys.path:
+    sys.path.append(base_path)
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.14.0")
@@ -294,7 +300,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=1000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -421,7 +427,6 @@ def main(output_dir, dataset_name):
     # freeze parameters of models to save more memory
     unet.requires_grad_(False)
     vae.requires_grad_(False)
-
     text_encoder.requires_grad_(False)
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
@@ -839,12 +844,11 @@ def main(output_dir, dataset_name):
             img = (torch.from_numpy(np.asarray(img))/255).permute(2, 0, 1)
             torchvision.utils.save_image(img, sample_save_dir + f"/sample_final_{global_step}_idx_{i}.png")
 
-
     accelerator.end_training()
 
 
 if __name__ == "__main__":
-    seq_metadata_path = "lora/data/kitti360/2013_05_28_drive_train_dynamic_vehicle_human_track_num_vehicles.txt" 
+    seq_metadata_path = base_path + "/lora/data/kitti360/2013_05_28_drive_train_dynamic_vehicle_human_track_num_vehicles.txt" 
     segments = []
     with open(seq_metadata_path) as f:
         for line in f:
@@ -855,10 +859,9 @@ if __name__ == "__main__":
             segments.append((seq, start_frame, end_frame))
 
     for seq, start_frame, end_frame in segments:
-        output_dir = f"lora/models/kitti360/{seq}/{start_frame}_{end_frame}"
-        dataset_name = f"lora/data/kitti360/{seq}/{start_frame}_{end_frame}"
+        output_dir = base_path + f"/lora/models_retrain/kitti360/{seq}/{start_frame}_{end_frame}"
+        dataset_name = base_path + f"/lora/data/kitti360/{seq}/{start_frame}_{end_frame}"
         main(output_dir=output_dir, dataset_name=dataset_name)
         shutil.copyfile(output_dir + "/pytorch_lora_weights.bin", output_dir + "/pytorch_model_weights.bin")
-        
         torch.cuda.empty_cache()
         gc.collect()

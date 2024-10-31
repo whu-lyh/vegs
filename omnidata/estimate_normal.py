@@ -1,41 +1,34 @@
-import torch
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-from torchvision import transforms
-import torchvision
-import PIL
-from PIL import Image
-import numpy as np
-import matplotlib.pyplot as plt
-
 import argparse
 import os.path
-from pathlib import Path
-from glob import glob
 import sys
+from glob import glob
 
-
-from modules.unet import UNet
-from modules.midas.dpt_depth import DPTDepthModel
+import numpy as np
+import PIL
+import torch
+import torchvision
+import torchvision.transforms.functional as TF
 from data.transforms import get_transform
+from modules.midas.dpt_depth import DPTDepthModel
+from modules.unet import UNet
+from PIL import Image
+from torchvision import transforms
 from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description='Visualize output for depth or surface normals')
 
 parser.add_argument('--task', type=str, default='normal' , help="normal or depth")
 parser.add_argument('--mode', type=str, default='all', help="all or cropped")
-
 parser.add_argument('--data_dir', type=str, default='/home/nas4_dataset/3D/KITTI-360', help="path to rgb image")
 
 args = parser.parse_args()
 
-root_dir = './omnidata/pretrained_models/'
+root_dir = '../weights/'
 
 trans_topil = transforms.ToPILImage()
 
 map_location = (lambda storage, loc: storage.cuda()) if torch.cuda.is_available() else torch.device('cpu')
 device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
 
 # get target task and model
 if args.task == 'normal':
@@ -149,7 +142,6 @@ def save_outputs(img_path, output_file_dir):
         # resize to original size
         output = torchvision.transforms.Resize((h, w), interpolation=TF.InterpolationMode.NEAREST)(output)
 
-        
         # convert output from [0, 1] to [-1, 1]
         pred_norm = (output - 0.5) * 2
         
@@ -166,13 +158,14 @@ def save_outputs(img_path, output_file_dir):
         im.save(os.path.join(output_file_dir, img_path.split("/")[-1].split(".")[0] + "_pred_norm.png"))
         np.save(os.path.join(output_file_dir, img_path.split("/")[-1].split(".")[0] + "_norm.npy"), pred_norm.detach().cpu().numpy())
 
-seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 2, 3, 4, 5, 6, 7, 9, 10]]
+# seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 2, 3, 4, 5, 6, 7, 9, 10]]
+seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 9]] # not full dataset due to the memory limit
 for seq in seqs:
-    seq_dir = os.path.join(args.data_dir, 'data_2d_raw', seq, "**/*.png")
+    seq_dir = os.path.join(args.data_dir, 'data_2d_rect_raw', seq, "**/*.png")
     img_paths = sorted(glob(seq_dir, recursive=True))
     new_idx = []
     for i in range(len(img_paths)):
-        if i %2 == 0:
+        if i % 2 == 0:
             new_idx.append(i//2)
         else:
             new_idx.append(len(img_paths)//2 + i//2)

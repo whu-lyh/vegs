@@ -480,7 +480,14 @@ def _make_vit_b_rn50_backbone(
 def _make_pretrained_vitb_rn50_384(
     pretrained, use_readout="ignore", hooks=None, use_vit_only=False
 ):
-    model = timm.create_model("vit_base_resnet50_384", pretrained=pretrained)
+    # here the haggingface net connection is unstable
+    model = timm.create_model("vit_base_resnet50_384", pretrained=False)
+    # model_name = "jx_vit_base_resnet50_384-9fd3c705"
+    # pretrained_weight_path = '/workspace/WorkSpaceRec/vegs/weights/{}.pth'.format(model_name)
+    # model = timm.create_model(
+    #             model_name, pretrained=False, num_classes=0,
+    #         )
+    # model.load_state_dict(torch.load(pretrained_weight_path))
 
     hooks = [0, 1, 8, 11] if hooks == None else hooks
     return _make_vit_b_rn50_backbone(

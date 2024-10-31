@@ -1,24 +1,25 @@
+import argparse
+import json
 import os
 import random
-
 from glob import glob
-from tqdm import tqdm
+
 from PIL import Image
-import json
-import argparse
+from tqdm import tqdm
 
 if __name__ == "__main__":
     # write me an argparse that takes seq, start_frame, end_frame, data_root, n_images, and out_dir as arguemnts
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data_root", type=str, default="/home/nas4_dataset/3D/KITTI-360")
+    parser.add_argument("--data_root", type=str, default="/public/KITTI360")
     parser.add_argument("--n_images", type=int, default=100)
-    parser.add_argument("--out_dir", type=str, default="/home/nas4_user/sungwonhwang/ws/diffusers/data/kitti360")
+    parser.add_argument("--out_dir", type=str, default="/public2/KITTI360/diffuers/")
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--use_blip", action="store_true")
 
     args = parser.parse_args() 
 
-    seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 2, 3, 4, 5, 6, 7, 9, 10]]
+    # seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 2, 3, 4, 5, 6, 7, 9, 10]]
+    seqs = [f"2013_05_28_drive_{str(i).zfill(4)}_sync" for i in [0, 9]]
     text_prompt = "a photography of a suburban street"
     
     for seq in tqdm(seqs, total=len(seqs)):
@@ -30,12 +31,9 @@ if __name__ == "__main__":
             out_dir = os.path.join(args.out_dir, seq, f"{str(start_frame).zfill(10)}_{str(end_frame).zfill(10)}", "train")
 
             os.makedirs(out_dir, exist_ok=True)
-
-            image_root = os.path.join(args.data_root, "data_2d_raw", seq, "**/*.png")
-
+            image_root = os.path.join(args.data_root, "data_2d_rect_raw", seq, "**/*.png")
             img_fs = glob(image_root, recursive=True)
             random.shuffle(img_fs)
-
 
             n_count = 0
             captions = []
